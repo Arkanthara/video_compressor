@@ -5,8 +5,8 @@ to H.265 (HEVC) or AV1 using NVIDIA NVENC hardware acceleration, with automatic
 quality-aware parameter optimization.
 
 <!-- Uncomment and update once the repo URL is set:
-[![CI](https://github.com/YOUR_USERNAME/videocompress/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/videocompress/actions/workflows/ci.yml)
-[![Release](https://github.com/YOUR_USERNAME/videocompress/actions/workflows/release.yml/badge.svg)](https://github.com/YOUR_USERNAME/videocompress/actions/workflows/release.yml)
+[![CI](https://github.com/Arkanthara/video_compressor/actions/workflows/ci.yml/badge.svg)](https://github.com/Arkanthara/video_compressor/actions/workflows/ci.yml)
+[![Release](https://github.com/Arkanthara/video_compressor/actions/workflows/release.yml/badge.svg)](https://github.com/Arkanthara/video_compressor/actions/workflows/release.yml)
 -->
 
 ---
@@ -53,7 +53,7 @@ quality-aware parameter optimization.
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/videocompress.git
+git clone https://github.com/Arkanthara/video_compressor.git
 cd videocompress
 
 # Install with uv (recommended)
@@ -66,7 +66,7 @@ pip install -e .
 ### From release binary
 
 Download the latest archive from the
-[Releases](https://github.com/YOUR_USERNAME/videocompress/releases) page:
+[Releases](https://github.com/Arkanthara/video_compressor/releases) page:
 
 | Platform | Archive |
 |----------|---------|
@@ -273,7 +273,7 @@ The CI will automatically sign the Windows executable during the release build.
 ### Setup
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/videocompress.git
+git clone https://github.com/Arkanthara/video_compressor.git
 cd videocompress
 uv sync --all-groups
 ```

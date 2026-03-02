@@ -31,9 +31,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/YOUR_USERNAME/videocompress"
-Repository = "https://github.com/YOUR_USERNAME/videocompress"
-Issues = "https://github.com/YOUR_USERNAME/videocompress/issues"
+Homepage = "https://github.com/Arkanthara/video_compressor"
+Repository = "https://github.com/Arkanthara/video_compressor"
+Issues = "https://github.com/Arkanthara/video_compressor/issues"
 
 [project.scripts]
 videocompress = "videocompress.cli:main"
