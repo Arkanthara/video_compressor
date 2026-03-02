@@ -1,0 +1,84 @@
+# =============================================================================
+# CI — Continuous Integration (lint, type-check)
+#
+# Git-Flow triggers:
+#   • Push to main, develop, release/*, hotfix/*
+#   • Pull requests targeting main or develop
+# =============================================================================
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - "release/**"
+      - "hotfix/**"
+  pull_request:
+    branches:
+      - main
+      - develop
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: uv sync --all-groups
+
+      - name: Ruff check (lint)
+        run: uv run ruff check videocompress/
+
+      - name: Ruff format check
+        run: uv run ruff format --check videocompress/
+
+  build-check:
+    name: Build verification
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install tkinter (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - name: Install dependencies
+        run: uv sync --all-groups
+
+      - name: Verify import
+        run: uv run python -c "import videocompress; print(videocompress.__version__)"
+
+      - name: CLI smoke test
+        run: uv run videocompress --help

@@ -1,0 +1,220 @@
+# =============================================================================
+# Release — Build executables & publish GitHub Release
+#
+# Git-Flow trigger:
+#   • Push a tag matching  v*  (e.g. v0.1.0, v1.2.3)
+#
+# The workflow:
+#   1. Builds Windows and Linux executables via PyInstaller (--onedir for fast
+#      startup — no temp-extraction overhead unlike --onefile).
+#   2. Optionally signs the Windows .exe with a code-signing certificate stored
+#      in repository secrets (WINDOWS_CERTIFICATE, WINDOWS_CERTIFICATE_PASSWORD).
+#   3. Creates a GitHub Release with auto-generated release notes and attaches
+#      the platform archives as assets.
+#
+# Required secrets for Windows code signing (optional):
+#   WINDOWS_CERTIFICATE          — Base64-encoded PFX certificate
+#   WINDOWS_CERTIFICATE_PASSWORD — Password for the PFX file
+#
+# To create a signed release:
+#   git tag -a v0.2.0 -m "Release v0.2.0: <summary>"
+#   git push origin v0.2.0
+# =============================================================================
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Build — Windows x64
+  # ─────────────────────────────────────────────────────────────────────────
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: uv sync --all-groups
+
+      - name: Build executable (PyInstaller --onedir)
+        shell: powershell
+        run: |
+          uv run pyinstaller `
+            --noconfirm `
+            --onedir `
+            --windowed `
+            --name videocompress `
+            --collect-all customtkinter `
+            --clean `
+            videocompress/__main__.py
+
+      - name: Sign Windows executable
+        if: ${{ env.HAS_CERT == 'true' }}
+        env:
+          HAS_CERT: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        shell: powershell
+        run: |
+          # Decode the PFX certificate from Base64
+          $certBytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          $certPath  = Join-Path $env:RUNNER_TEMP "code_signing.pfx"
+          [IO.File]::WriteAllBytes($certPath, $certBytes)
+
+          # Locate signtool.exe from the Windows SDK
+          $signtool = Get-ChildItem `
+            -Path "C:\Program Files (x86)\Windows Kits" `
+            -Recurse -Filter "signtool.exe" `
+            -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "x64" } |
+            Select-Object -First 1
+
+          if (-not $signtool) {
+            Write-Error "signtool.exe not found"
+            exit 1
+          }
+
+          # Sign the main executable with SHA-256 + RFC 3161 timestamp
+          & $signtool.FullName sign `
+            /f $certPath `
+            /p $env:WINDOWS_CERTIFICATE_PASSWORD `
+            /fd sha256 `
+            /tr http://timestamp.digicert.com `
+            /td sha256 `
+            "dist\videocompress\videocompress.exe"
+
+          # Clean up certificate
+          Remove-Item $certPath -Force
+
+      - name: Package archive
+        shell: powershell
+        run: |
+          Compress-Archive `
+            -Path "dist\videocompress\*" `
+            -DestinationPath "videocompress-windows-x64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: videocompress-windows-x64.zip
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Build — Linux x64
+  # ─────────────────────────────────────────────────────────────────────────
+  build-linux:
+    name: Build Linux x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - name: Install dependencies
+        run: uv sync --all-groups
+
+      - name: Build executable (PyInstaller --onedir)
+        run: |
+          uv run pyinstaller \
+            --noconfirm \
+            --onedir \
+            --name videocompress \
+            --collect-all customtkinter \
+            --clean \
+            videocompress/__main__.py
+
+      - name: Package archive
+        run: tar czf videocompress-linux-x64.tar.gz -C dist videocompress
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-build
+          path: videocompress-linux-x64.tar.gz
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Create GitHub Release
+  # ─────────────────────────────────────────────────────────────────────────
+  release:
+    name: Publish Release
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # Find the previous tag for changelog generation
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${TAG}$" | head -n1)
+
+          echo "## What's Changed" > release_notes.md
+          echo "" >> release_notes.md
+
+          if [ -n "$PREV_TAG" ]; then
+            echo "Changes since **${PREV_TAG}**:" >> release_notes.md
+            echo "" >> release_notes.md
+            git log --pretty=format:"- %s (%h)" "${PREV_TAG}..${TAG}" >> release_notes.md
+          else
+            echo "Initial release." >> release_notes.md
+            echo "" >> release_notes.md
+            git log --pretty=format:"- %s (%h)" >> release_notes.md
+          fi
+
+          echo "" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "## Installation" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "Download the archive for your platform, extract, and run \`videocompress\` (or \`videocompress.exe\` on Windows)." >> release_notes.md
+          echo "" >> release_notes.md
+          echo "**Requirements:** FFmpeg with NVIDIA NVENC support must be installed and available in PATH." >> release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "videocompress ${{ github.ref_name }}"
+          body_path: release_notes.md
+          generate_release_notes: false
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          files: |
+            windows-build/videocompress-windows-x64.zip
+            linux-build/videocompress-linux-x64.tar.gz
