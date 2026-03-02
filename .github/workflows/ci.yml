@@ -10,13 +10,13 @@ name: CI
 on:
   push:
     branches:
-      - main
+      - master
       - develop
       - "release/**"
       - "hotfix/**"
   pull_request:
     branches:
-      - main
+      - master
       - develop
 
 concurrency:
@@ -43,8 +43,14 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-groups
 
+      - name: Install test dependencies
+        run: uv sync --extra test
+
       - name: Ruff check (lint)
         run: uv run ruff check videocompress/
+
+      - name: Ruff auto-format
+        run: uv run ruff format videocompress/
 
       - name: Ruff format check
         run: uv run ruff format --check videocompress/
@@ -77,8 +83,14 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-groups
 
+      - name: Install test dependencies
+        run: uv sync --extra test
+
       - name: Verify import
         run: uv run python -c "import videocompress; print(videocompress.__version__)"
 
       - name: CLI smoke test
         run: uv run videocompress --help
+
+      - name: Run tests
+        run: uv run pytest -q

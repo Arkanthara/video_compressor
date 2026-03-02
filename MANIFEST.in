@@ -1,0 +1,5 @@
+include README.md
+include LICENSE
+prune test_videos
+prune .github
+exclude uv.lock

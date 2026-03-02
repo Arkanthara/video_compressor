@@ -20,6 +20,7 @@ import shutil
 import statistics
 import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 from videocompress.models import (
@@ -30,6 +31,8 @@ from videocompress.models import (
     OptimizeResult,
     TargetCodec,
 )
+
+ProgressCallback = Callable[[float, str], None]
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
@@ -357,6 +360,19 @@ def _x265_extra_args(bit_depth: int) -> list[str]:
     return args
 
 
+def _libaom_extra_args(bit_depth: int, cpu_used: int) -> list[str]:
+    """Build libaom-av1 tuning args.
+
+    ``cpu_used`` controls the speed/quality tradeoff (lower = better quality,
+    higher = faster). Row-based multi-threading improves throughput on modern
+    CPUs without changing quality policy.
+    """
+    args = ["-cpu-used", str(cpu_used), "-row-mt", "1"]
+    if bit_depth == 10:
+        args += ["-pix_fmt", "yuv420p10le"]
+    return args
+
+
 def build_default_candidates(codec: TargetCodec, encoder: str = "") -> list[OptimizeCandidate]:
     """Return a comprehensive set of candidates for parameter search.
 
@@ -376,25 +392,70 @@ def build_default_candidates(codec: TargetCodec, encoder: str = "") -> list[Opti
     """
     candidates: list[OptimizeCandidate] = []
 
-    if codec == TargetCodec.AV1 and "nvenc" in encoder:
-        # ── AV1 NVENC candidates ───────────────────────────────────────
-        for preset in ["p7", "p6", "p5"]:
-            cq_values = (
-                [38, 34, 30, 26, 22]
-                if preset == "p7"
-                else [34, 30, 26]
-                if preset == "p6"
-                else [30, 26]
-            )
-            for cq in cq_values:
+    if codec == TargetCodec.AV1:
+        if "av1_nvenc" in encoder:
+            # ── AV1 NVENC candidates ───────────────────────────────────
+            for preset in ["p7", "p6", "p5"]:
+                cq_values = (
+                    [38, 34, 30, 26, 22]
+                    if preset == "p7"
+                    else [34, 30, 26]
+                    if preset == "p6"
+                    else [30, 26]
+                )
+                for cq in cq_values:
+                    candidates.append(
+                        OptimizeCandidate(
+                            preset=preset,
+                            quality=cq,
+                            rc_mode="vbr",
+                            bit_depth=10,
+                            extra_args=["-bf", "3", "-g", "250"],
+                            label=f"VBR-{preset}-cq{cq}-10bit",
+                        )
+                    )
+
+        elif "libaom-av1" in encoder:
+            # ── AV1 CPU (libaom) candidates ────────────────────────────
+            for cpu_used, crf_values in [
+                (8, [40, 36, 32]),
+                (6, [36, 32, 28, 24]),
+                (4, [32, 28, 24, 20]),
+            ]:
+                for crf in crf_values:
+                    candidates.append(
+                        OptimizeCandidate(
+                            preset=f"cpu{cpu_used}",
+                            quality=crf,
+                            rc_mode="crf",
+                            bit_depth=10,
+                            extra_args=_libaom_extra_args(10, cpu_used),
+                            label=f"CRF-cpu{cpu_used}-crf{crf}-10bit",
+                        )
+                    )
+
+            for crf in [32, 28, 24]:
                 candidates.append(
                     OptimizeCandidate(
-                        preset=preset,
-                        quality=cq,
-                        rc_mode="vbr",
-                        bit_depth=10,
-                        extra_args=["-bf", "3", "-g", "250"],
-                        label=f"VBR-{preset}-cq{cq}-10bit",
+                        preset="cpu6",
+                        quality=crf,
+                        rc_mode="crf",
+                        bit_depth=8,
+                        extra_args=_libaom_extra_args(8, 6),
+                        label=f"CRF-cpu6-crf{crf}-8bit",
+                    )
+                )
+
+        else:
+            for crf in [34, 30, 26]:
+                candidates.append(
+                    OptimizeCandidate(
+                        preset="cpu6",
+                        quality=crf,
+                        rc_mode="crf",
+                        bit_depth=8,
+                        extra_args=[],
+                        label=f"CRF-cpu6-crf{crf}",
                     )
                 )
 
@@ -510,6 +571,24 @@ def build_default_candidates(codec: TargetCodec, encoder: str = "") -> list[Opti
     return candidates
 
 
+def _choose_balanced_fallback(candidates: list[OptimizeCandidate]) -> OptimizeCandidate:
+    """Pick a balanced fallback candidate when search cannot score candidates.
+
+    Preference order:
+    1) quality-based modes (vbr/crf) over constqp/cbr
+    2) 10-bit over 8-bit
+    3) quality closest to 28 (middle-of-the-road compression level)
+    """
+    preferred = [c for c in candidates if c.rc_mode in {"vbr", "crf"}] or list(candidates)
+    return min(
+        preferred,
+        key=lambda c: (
+            0 if c.bit_depth == 10 else 1,
+            abs(c.quality - 28),
+        ),
+    )
+
+
 def _extract_segment_lossless(
     ffmpeg: str,
     input_path: Path,
@@ -573,9 +652,10 @@ def _encode_segment(
         "-an",
         "-c:v",
         encoder,
-        "-preset",
-        candidate.preset,
     ]
+
+    if "libaom-av1" not in encoder:
+        cmd += ["-preset", candidate.preset]
 
     # Rate control parameters
     if "nvenc" in encoder:
@@ -585,6 +665,8 @@ def _encode_segment(
             cmd += ["-rc", "cbr", "-b:v", f"{candidate.quality}k"]
         else:  # vbr (default, best quality/size ratio)
             cmd += ["-rc", "vbr", "-cq", str(candidate.quality), "-b:v", "0"]
+    elif "libaom-av1" in encoder:
+        cmd += ["-crf", str(candidate.quality), "-b:v", "0"]
     else:
         # libx265, libaom-av1, etc.
         cmd += ["-crf", str(candidate.quality)]
@@ -650,6 +732,8 @@ def _build_candidate_encode_args(candidate: OptimizeCandidate, encoder: str) -> 
             args += ["-rc", "cbr", "-b:v", f"{candidate.quality}k"]
         else:
             args += ["-rc", "vbr", "-cq", str(candidate.quality), "-b:v", "0"]
+    elif "libaom-av1" in encoder:
+        args += ["-crf", str(candidate.quality), "-b:v", "0"]
     else:
         args += ["-crf", str(candidate.quality)]
     args += list(candidate.extra_args)
@@ -665,6 +749,7 @@ def optimize_encoding_params(
     initial_candidates: list[OptimizeCandidate],
     container_suffix: str,
     input_duration_seconds: float = 0.0,
+    progress_callback: ProgressCallback | None = None,
 ) -> OptimizeResult:
     """Find encoding params that minimise output size while keeping quality >= threshold.
 
@@ -742,8 +827,8 @@ def optimize_encoding_params(
                 ref_clips.append(ref)
 
         if not ref_clips:
-            fallback = initial_candidates[0]
-            print("  Could not extract reference segments — using safest candidate")
+            fallback = _choose_balanced_fallback(initial_candidates)
+            print("  Could not extract reference segments — using balanced fallback candidate")
             return OptimizeResult(
                 preset=fallback.preset,
                 quality=fallback.quality,
@@ -755,6 +840,18 @@ def optimize_encoding_params(
 
         print(f"  Extracted {len(ref_clips)} reference segment(s)\n")
 
+        segments_total = len(ref_clips)
+        total_steps = max(1, len(initial_candidates) * max(1, segments_total))
+        completed_steps = 0
+
+        def _emit_progress(message: str, *, steps: int = 0) -> None:
+            nonlocal completed_steps
+            if steps:
+                completed_steps = min(completed_steps + steps, total_steps)
+            if progress_callback:
+                pct = min((completed_steps / total_steps) * 100.0, 99.9)
+                progress_callback(pct, message)
+
         # Track which preset groups already have a passing candidate.
         # Key = (preset, rc_mode, bit_depth).  Once one candidate passes for
         # a group, lower-CQ candidates in the same group only produce bigger
@@ -765,6 +862,7 @@ def optimize_encoding_params(
         n_skipped = 0
         for idx, candidate in enumerate(initial_candidates, 1):
             label = candidate.label or f"{candidate.preset}-q{candidate.quality}"
+            status_prefix = f"Optimizing quality... {idx}/{len(initial_candidates)}"
 
             # ── GROUP SKIP: already found smallest passing file for this group ──
             group_key = (candidate.preset, candidate.rc_mode, candidate.bit_depth)
@@ -773,6 +871,10 @@ def optimize_encoding_params(
                 print(
                     f"  [{idx:2d}/{len(initial_candidates)}]"
                     f" {label:40s} SKIPPED (group already passed)"
+                )
+                _emit_progress(
+                    f"{status_prefix} (skipped)",
+                    steps=max(1, segments_total),
                 )
                 search_report.append(
                     CandidateReport(
@@ -796,6 +898,7 @@ def optimize_encoding_params(
             seg_p10s: list[float] = []
             encode_failed = False
             early_aborted = False
+            segments_tested = 0
 
             for i, ref_clip in enumerate(ref_clips):
                 ext = container_suffix or "mkv"
@@ -803,6 +906,11 @@ def optimize_encoding_params(
 
                 if not _encode_segment(ffmpeg, ref_clip, enc_out, encoder, candidate):
                     encode_failed = True
+                    segments_tested += 1
+                    _emit_progress(
+                        f"{status_prefix} (segment {segments_tested}/{segments_total})",
+                        steps=1,
+                    )
                     break
 
                 total_size += enc_out.stat().st_size
@@ -819,6 +927,12 @@ def optimize_encoding_params(
                 if p10 is not None:
                     seg_p10s.append(p10)
 
+                segments_tested += 1
+                _emit_progress(
+                    f"{status_prefix} (segment {segments_tested}/{segments_total})",
+                    steps=1,
+                )
+
                 # ── EARLY ABORT: reject candidate immediately on quality failure ──
                 if avg is not None and avg < effective_threshold:
                     early_aborted = True
@@ -830,6 +944,12 @@ def optimize_encoding_params(
                 # Clean up encoded file to save disk space in temp dir
                 if enc_out.exists():
                     enc_out.unlink()
+
+            if segments_tested < segments_total:
+                _emit_progress(
+                    f"{status_prefix} (skipped {segments_total - segments_tested} segments)",
+                    steps=segments_total - segments_tested,
+                )
 
             if encode_failed:
                 print("ENCODE FAILED")
@@ -968,17 +1088,21 @@ def optimize_encoding_params(
                 f"sample_size={size_str}"
             )
             print(f"{'~' * 72}\n")
+            if progress_callback:
+                progress_callback(100.0, "Optimization complete")
             return best
 
-        # Nothing passed — return the safest (lowest CQ / highest quality) candidate
-        fallback = initial_candidates[-1]  # last = most conservative (lowest CQ)
+        # Nothing passed — return a balanced fallback candidate.
+        fallback = _choose_balanced_fallback(initial_candidates)
         print(
-            f"  No candidate passed quality threshold — using safest: "
+            f"  No candidate passed quality threshold — using fallback: "
             f"{fallback.preset} q={fallback.quality}"
         )
         print(f"{'~' * 72}\n")
 
         encode_args = _build_candidate_encode_args(fallback, encoder)
+        if progress_callback:
+            progress_callback(100.0, "Optimization complete")
         return OptimizeResult(
             preset=fallback.preset,
             quality=fallback.quality,

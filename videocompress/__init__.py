@@ -10,13 +10,13 @@ Modules:
     ffprobe_info  — Input file stream inspection via ffprobe
     gui           — Graphical user interface (customtkinter)
     models        — Dataclasses, enums, and error types
+    profiles      — Camera/high-bitrate compression profiles
     quality       — Quality metrics computation and parameter search
     reporting     — JSON report generation
     transcode     — FFmpeg encoding pipeline and job runner
 """
 
 __version__ = "0.1.0"
-
 __all__ = [
     "__version__",
     "capabilities",
@@ -24,6 +24,7 @@ __all__ = [
     "ffprobe_info",
     "gui",
     "models",
+    "profiles",
     "quality",
     "reporting",
     "transcode",

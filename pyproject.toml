@@ -1,10 +1,10 @@
 [project]
-name = "videocompress"
+name = "transcoder-h265-av1"
 version = "0.1.0"
 description = "GPU-accelerated H.264 to H.265/AV1 compressor with NVIDIA NVENC and quality-aware optimization"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "MIT"}
+license = {file = "LICENSE"}
 keywords = ["video", "compression", "hevc", "av1", "nvenc", "gpu", "ffmpeg", "transcode"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -28,12 +28,17 @@ dependencies = [
 dev = [
     "pyinstaller>=6.0",
     "ruff>=0.8.0",
+    "pytest>=8.3.0",
+]
+test = [
+    "pytest>=8.3.0",
+    "ruff>=0.8.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/YOUR_USERNAME/videocompress"
-Repository = "https://github.com/YOUR_USERNAME/videocompress"
-Issues = "https://github.com/YOUR_USERNAME/videocompress/issues"
+Homepage = "https://github.com/Arkanthara/video_compressor"
+Repository = "https://github.com/Arkanthara/video_compressor"
+Issues = "https://github.com/Arkanthara/video_compressor/issues"
 
 [project.scripts]
 videocompress = "videocompress.cli:main"
@@ -55,3 +60,11 @@ select = ["E", "F", "I", "N", "W", "UP"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["videocompress"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "integration: requires ffmpeg and sample videos",
+]

@@ -16,6 +16,7 @@ import json
 import sys
 from pathlib import Path
 
+from videocompress.inputs import collect_video_files
 from videocompress.models import (
     AudioMode,
     Container,
@@ -24,6 +25,7 @@ from videocompress.models import (
     JobOptions,
     TargetCodec,
 )
+from videocompress.quality import default_threshold_for_metric
 from videocompress.reporting import write_report
 from videocompress.transcode import run_job
 
@@ -34,15 +36,6 @@ def _launch_gui() -> int:
 
     launch()
     return 0
-
-
-def _collect_inputs(base: Path, recursive: bool) -> list[Path]:
-    """Discover video files under *base*, optionally recursing into sub-directories."""
-    patterns = ("*.mp4", "*.mkv", "*.mov")
-    files: list[Path] = []
-    for pattern in patterns:
-        files.extend(base.rglob(pattern) if recursive else base.glob(pattern))
-    return sorted({path for path in files if path.is_file()})
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -61,6 +54,15 @@ def _build_parser() -> argparse.ArgumentParser:
         )
         p.add_argument("--container", choices=["mp4", "mkv"], default="mkv")
         p.add_argument("--preset", default="p5")
+        p.add_argument(
+            "--rc-mode",
+            choices=["auto", "vbr", "constqp", "cbr", "crf"],
+            default="vbr",
+            help=(
+                "Rate-control mode. 'auto' picks the best default for the active encoder "
+                "(NVENC->vbr, CPU->crf)."
+            ),
+        )
         p.add_argument("--quality", type=int, default=22)
         p.add_argument("--quality-mode", action="store_true", default=True)
         p.add_argument("--no-quality-mode", dest="quality_mode", action="store_false")
@@ -86,8 +88,16 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("--report-json", type=Path)
         p.add_argument(
             "--enable-gpu-optimization",
+            dest="enable_gpu_optimization",
             action="store_true",
-            help="Opt-in feature flag for GPU optimization pipeline",
+            default=True,
+            help="Enable NVIDIA GPU acceleration (enabled by default).",
+        )
+        p.add_argument(
+            "--disable-gpu-optimization",
+            dest="enable_gpu_optimization",
+            action="store_false",
+            help="Disable GPU acceleration and force CPU encoding.",
         )
         p.add_argument(
             "--lossless",
@@ -143,8 +153,9 @@ def _options_from_args(args: argparse.Namespace, input_path: Path) -> JobOptions
         quality_threshold=(
             args.quality_threshold
             if args.quality_threshold is not None
-            else {"ssim": 0.97, "psnr": 40.0, "vmaf": 95.0}.get(args.quality_metric, 0.97)
+            else default_threshold_for_metric(args.quality_metric)
         ),
+        rc_mode=args.rc_mode,
         auto_search_best=args.auto_search_best,
         enable_gpu_optimization=args.enable_gpu_optimization,
         dry_run=args.dry_run,
@@ -176,11 +187,13 @@ def _run_single(args: argparse.Namespace, input_path: Path) -> int:
                 "effective_codec": outcome.selected_path.effective_codec.value,
                 "encoder": outcome.selected_path.encoder,
                 "lossless": opts.lossless,
+                "rc_mode": opts.rc_mode,
                 "used_gpu": outcome.selected_path.used_gpu,
                 "fallback_used": outcome.selected_path.fallback_used,
                 "input_mb": round(outcome.input_size / 1_048_576, 2),
                 "output_mb": round(outcome.output_size / 1_048_576, 2),
                 "compression_ratio": round(outcome.compression_ratio, 4),
+                "copied_original": outcome.copied_original,
                 "diagnostics": outcome.diagnostics,
                 "command": outcome.command if args.dry_run else None,
             },
@@ -207,9 +220,12 @@ def main(argv: list[str] | None = None) -> int:
             if not args.input_dir.exists() or not args.input_dir.is_dir():
                 raise JobError("invalid-input-dir", f"Input directory not found: {args.input_dir}")
 
-            files = _collect_inputs(args.input_dir, args.recursive)
+            files = collect_video_files(args.input_dir, args.recursive, probe_unknown=True)
             if not files:
-                raise JobError("no-input-files", "No input files found matching .mp4/.mkv/.mov")
+                raise JobError(
+                    "no-input-files",
+                    "No video files found in the input directory.",
+                )
 
             failed = 0
             for file_path in files:

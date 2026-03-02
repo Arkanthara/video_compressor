@@ -5,8 +5,8 @@ to H.265 (HEVC) or AV1 using NVIDIA NVENC hardware acceleration, with automatic
 quality-aware parameter optimization.
 
 <!-- Uncomment and update once the repo URL is set:
-[![CI](https://github.com/YOUR_USERNAME/videocompress/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/videocompress/actions/workflows/ci.yml)
-[![Release](https://github.com/YOUR_USERNAME/videocompress/actions/workflows/release.yml/badge.svg)](https://github.com/YOUR_USERNAME/videocompress/actions/workflows/release.yml)
+[![CI](https://github.com/Arkanthara/video_compressor/actions/workflows/ci.yml/badge.svg)](https://github.com/Arkanthara/video_compressor/actions/workflows/ci.yml)
+[![Release](https://github.com/Arkanthara/video_compressor/actions/workflows/release.yml/badge.svg)](https://github.com/Arkanthara/video_compressor/actions/workflows/release.yml)
 -->
 
 ---
@@ -20,10 +20,14 @@ quality-aware parameter optimization.
 | **Automatic parameter search** | Tests multiple presets & quality levels on sample segments |
 | **Quality gating** | VMAF, SSIM, or PSNR with per-frame P10 floor checking |
 | **Batch processing** | Compress entire folders with optional recursive scan |
+| **Broad format support** | Accepts most video containers; unknown extensions are probed with ffprobe |
 | **Modern GUI** | Dark-themed interface with real-time progress and console output |
+| **Profile families** | Two guided preset families: Camera/Streaming (HEVC) and Archive/Delivery (AV1) |
 | **CLI** | Full-featured command-line interface for scripting and automation |
 | **Lossless mode** | Mathematically lossless encoding (hevc_nvenc `-tune lossless`) |
 | **Smart fallbacks** | Automatic codec or CPU fallback when GPU encoder is unavailable |
+| **Container-safe subtitles** | Automatically converts text subtitles for MP4 or falls back to MKV when needed |
+| **No-regression size policy** | If encoded output is larger than source, original is kept and conversion is reported as skipped |
 | **Detailed reports** | JSON export with compression metrics, search results, diagnostics |
 
 ---
@@ -49,11 +53,17 @@ quality-aware parameter optimization.
 
 ## Installation
 
+### From PyPI
+
+```bash
+pip install transcoder-h265-av1
+```
+
 ### From source (recommended for development)
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/videocompress.git
+git clone https://github.com/Arkanthara/video_compressor.git
 cd videocompress
 
 # Install with uv (recommended)
@@ -66,7 +76,7 @@ pip install -e .
 ### From release binary
 
 Download the latest archive from the
-[Releases](https://github.com/YOUR_USERNAME/videocompress/releases) page:
+[Releases](https://github.com/Arkanthara/video_compressor/releases) page:
 
 | Platform | Archive |
 |----------|---------|
@@ -91,11 +101,36 @@ videocompress-gui
 ```
 
 The GUI provides:
+- Tabbed input panels (`Video File` / `Folder`) so only one input mode is active at a time
 - File and folder pickers for input selection
 - Auto Encoding tab (recommended) with quality metric and threshold settings
-- Manual Encoding tab for direct preset/quality control
+- Manual Encoding tab for direct preset/rate-control/quality control
+- Camera Footage Profiles tab with family selector, profile presets, RC mode, quality factor, metric, and threshold controls
+- Built-in encoding guide explaining preset levels (`p7`, `p6`, `p5`), RC modes, quality factor ranges, and post-encode validation behavior
 - Real-time progress bar and scrolling console output
 - Start / Stop controls
+
+### Camera Footage Profiles (GUI)
+
+Use this tab when footage comes directly from a camera or for long-term archive delivery.
+
+Profile families:
+- **Camera / Streaming (HEVC)**: production-ready outputs for streaming and distribution.
+   Includes **High Quality - Netflix-like Master**, **Medium Quality - YouTube-like Upload**, and faster distribution/proxy options.
+- **Archive / Delivery (AV1)**: storage-focused outputs with stronger compression.
+   Includes high/medium AV1 archive targets plus an aggressive long-term storage option.
+
+You can always override profile defaults manually:
+- Rate control mode (`auto`, `vbr`, `constqp`, `cbr`, `crf`)
+- Quality factor (CQ/CRF)
+- Metric/threshold
+- Validation toggle
+
+Guide summary shown in the UI:
+- **Preset**: `p7` = best quality/compression (slowest), `p6` = balanced, `p5` = faster/less efficient.
+- **Quality factor (CQ/CRF)**: lower is higher quality and larger files; higher is smaller files with more artifacts.
+- **RC mode**: use `vbr` for most delivery workflows, `constqp` for fixed quality, `cbr` for constrained bitrate pipes, `crf` for CPU-driven quality mode.
+- **Post-encode validation**: compares source/output quality (VMAF/SSIM/PSNR) when enabled; if encoded output is larger, original is kept and validation is skipped.
 
 ### CLI mode
 
@@ -104,6 +139,9 @@ The GUI provides:
 ```bash
 # Basic — auto-detect codec, default quality gating
 videocompress file input.mp4
+
+# Works with most container formats (mkv, avi, mts, iso, ...)
+videocompress file input.mts
 
 # Specify codec and quality metric
 videocompress file input.mp4 --codec hevc --quality-metric vmaf --quality-threshold 95
@@ -139,13 +177,15 @@ videocompress batch ./videos --no-auto-search-best --preset p7 --quality 28
 | `--container` | `mkv` | Output format: `mkv` or `mp4` |
 | `--audio` | `copy` | Audio handling: `copy`, `aac`, or `opus` |
 | `--preset` | `p5` | NVENC preset (`p1`–`p7`) or CPU preset (`fast`, `medium`, `slow`) |
+| `--rc-mode` | `vbr` | Rate control mode: `auto`, `vbr`, `constqp`, `cbr`, `crf` (`auto` searches all compatible modes in auto-search) |
 | `--quality` | `22` | Quality level 0–51 (lower = higher quality) |
 | `--quality-metric` | `vmaf` | Quality gate metric: `vmaf`, `ssim`, or `psnr` |
 | `--quality-threshold` | auto | Minimum score to pass (VMAF=95, SSIM=0.97, PSNR=40) |
 | `--auto-search-best` | `true` | Enable automatic parameter search |
 | `--search-presets` | `all` | Comma-separated preset filter (e.g. `p7,p6`) |
 | `--validate-quality` | `true` | Post-encode full quality validation |
-| `--enable-gpu-optimization` | off | Enable NVIDIA GPU acceleration |
+| `--enable-gpu-optimization` | on | Enable NVIDIA GPU acceleration |
+| `--disable-gpu-optimization` | off | Force CPU path (disable GPU acceleration) |
 | `--lossless` | off | Mathematically lossless encoding |
 | `--fallback-mode` | `fallback-codec` | `fail-fast`, `fallback-codec`, or `fallback-cpu` |
 | `--dry-run` | off | Print FFmpeg command without encoding |
@@ -153,6 +193,10 @@ videocompress batch ./videos --no-auto-search-best --preset p7 --quality 28
 | `--output-dir` | `./output` | Output directory |
 | `--report-json` | none | Save JSON report to this path |
 | `--recursive` | off | Include sub-folders (batch mode) |
+
+If an encoded file is not smaller than the source, videocompress keeps a copy of the original file and logs a warning instead of replacing it with a larger transcode.
+
+Default RC mode is `vbr` because it generally gives the best compression efficiency for quality-constrained GPU encoding.
 
 ---
 
@@ -273,7 +317,7 @@ The CI will automatically sign the Windows executable during the release build.
 ### Setup
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/videocompress.git
+git clone https://github.com/Arkanthara/video_compressor.git
 cd videocompress
 uv sync --all-groups
 ```
@@ -292,6 +336,22 @@ uv run ruff format --check videocompress/
 
 # Apply formatting
 uv run ruff format videocompress/
+```
+
+### Tests
+
+```bash
+# Unit tests (fast)
+uv run pytest -q
+
+# Integration tests (requires ffmpeg + sample videos)
+VIDEOCOMPRESS_INTEGRATION=1 uv run pytest -q -m integration
+```
+
+### Option matrix (dry-run)
+
+```bash
+uv run python scripts/run_option_matrix.py --input test_videos/sample_mkv_01.mkv
 ```
 
 ### Git-Flow workflow
@@ -365,6 +425,7 @@ videocompress/
 ├── cli.py               # Command-line interface (file, batch, gui)
 ├── gui.py               # Graphical interface (customtkinter)
 ├── models.py            # Dataclasses, enums, error types
+├── profiles.py          # Profile families and guided encoding presets
 ├── capabilities.py      # GPU / FFmpeg capability detection
 ├── ffprobe_info.py      # Input video stream inspection
 ├── quality.py           # Quality metrics & parameter optimization

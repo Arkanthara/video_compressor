@@ -161,6 +161,8 @@ class JobOptions:
     overwrite: bool
     audio_mode: AudioMode
     quality_threshold: float = 0.97
+    rc_mode: str = "vbr"
+    keep_original_if_larger: bool = True
     report_json: Path | None = None
     lossless: bool = False
     encoder_extra_args: list[str] = field(default_factory=list)
@@ -203,6 +205,14 @@ class JobOptions:
                 "Quality must be an integer between 0 and 51.",
             )
 
+        valid_rc_modes = {"auto", "vbr", "constqp", "cbr", "crf"}
+        if self.rc_mode not in valid_rc_modes:
+            raise JobError(
+                "invalid-rc-mode",
+                f"Unsupported rc_mode '{self.rc_mode}'."
+                f" Supported values: {sorted(valid_rc_modes)}",
+            )
+
 
 @dataclass(slots=True)
 class JobOutcome:
@@ -220,6 +230,7 @@ class JobOutcome:
     metrics: dict[str, MetricResult]
     command: list[str]
     diagnostics: list[str]
+    copied_original: bool = False
     taxonomy: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -284,5 +295,6 @@ class JobOutcome:
             },
             "command": self.command,
             "diagnostics": self.diagnostics,
+            "copied_original": self.copied_original,
             "taxonomy": self.taxonomy,
         }

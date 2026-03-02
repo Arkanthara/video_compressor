@@ -58,3 +58,10 @@ videocompress/output/
 
 # ── OpenSpec working files (keep archive) ────────────────────────────────────
 # openspec/ is tracked — change artifacts are managed by the openspec workflow.
+*test_videos
+*output
+*.venv
+*.ruff_cache
+*.pytest_cache
+*tmp
+*__pycache__

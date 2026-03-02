@@ -1,9 +1,9 @@
 """customtkinter GUI for videocompress — GPU-accelerated video compressor.
 
 Provides a modern, dark-themed interface with:
-  - File / folder pickers for input selection
-  - Codec, container, audio, and fallback dropdowns
-  - Tabbed Auto / Manual encoding modes
+    - Tabbed input pickers (single file or folder)
+    - Codec, container, audio, and fallback dropdowns
+    - Tabbed Auto / Manual / Camera Profile encoding modes
   - Real-time progress bar and scrolling console output
   - Start / Stop controls with background-threaded encoding
 
@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import queue
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
 from videocompress import __version__
+from videocompress.inputs import collect_video_files, video_filetypes
 from videocompress.models import (
     AudioMode,
     Container,
@@ -34,6 +36,15 @@ from videocompress.models import (
     JobOptions,
     TargetCodec,
 )
+from videocompress.profiles import (
+    default_profile_family_name,
+    default_profile_name,
+    encoding_guide_text,
+    get_profile,
+    profile_family_names,
+    profile_names,
+)
+from videocompress.quality import default_threshold_for_metric
 from videocompress.reporting import write_report
 from videocompress.transcode import run_job
 
@@ -55,15 +66,32 @@ _SEARCH_PRESET_MAP: dict[str, list[str]] = {
 """Map GUI dropdown labels to the preset list expected by the optimizer."""
 
 _DEFAULT_QUALITY_THRESHOLDS: dict[str, float] = {
-    "vmaf": 95.0,
-    "ssim": 0.97,
-    "psnr": 40.0,
+    metric: default_threshold_for_metric(metric) for metric in ("vmaf", "ssim", "psnr")
 }
 """Sensible default quality thresholds per metric."""
 
-_VIDEO_EXTENSIONS = ("*.mp4", "*.mkv", "*.mov", "*.MP4", "*.MKV", "*.MOV")
-"""Glob patterns used to discover video files in a folder."""
+_INPUT_TAB_VIDEO = "Video File"
+_INPUT_TAB_FOLDER = "Folder"
 
+_ENC_TAB_AUTO = "Auto Encoding (recommended)"
+_ENC_TAB_MANUAL = "Manual Encoding"
+_ENC_TAB_CAMERA = "Camera Footage Profiles"
+
+_PRESET_VALUES = ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "fast", "medium", "slow"]
+_RC_MODE_VALUES = ["auto", "vbr", "constqp", "cbr", "crf"]
+
+
+@dataclass(slots=True)
+class _RunConfig:
+    auto_search: bool
+    metric: str
+    threshold: float
+    rc_mode: str
+    search_presets: list[str]
+    preset: str
+    quality: int
+    validate_quality: bool
+    mode_label: str
 
 # ---------------------------------------------------------------------------
 # Application
@@ -142,37 +170,46 @@ class VideoCompressApp(ctk.CTk):
 
     def _build_input_section(self) -> None:
         sec = self._section(row=2, title="Input")
-        sec.columnconfigure(1, weight=1)
+        sec.columnconfigure(0, weight=1)
 
-        # Video file
-        ctk.CTkLabel(sec, text="Video File:", width=self._LABEL_WIDTH, anchor="w").grid(
-            row=1, column=0, sticky="w", padx=10, pady=3
-        )
         self._input_file = ctk.StringVar()
-        ctk.CTkEntry(sec, textvariable=self._input_file).grid(
-            row=1, column=1, sticky="ew", padx=5, pady=3
-        )
-        ctk.CTkButton(sec, text="Browse", width=80, command=self._browse_file).grid(
-            row=1, column=2, padx=10, pady=3
-        )
-
-        # Input folder
-        ctk.CTkLabel(sec, text="Input Folder:", width=self._LABEL_WIDTH, anchor="w").grid(
-            row=2, column=0, sticky="w", padx=10, pady=3
-        )
         self._input_dir = ctk.StringVar()
-        ctk.CTkEntry(sec, textvariable=self._input_dir).grid(
-            row=2, column=1, sticky="ew", padx=5, pady=3
+        self._recursive = ctk.BooleanVar(value=False)
+
+        tabs = ctk.CTkTabview(sec, height=150)
+        tabs.grid(row=1, column=0, sticky="ew", padx=10, pady=(3, 10))
+        self._input_tabs = tabs
+
+        tab_video = tabs.add(_INPUT_TAB_VIDEO)
+        tab_video.columnconfigure(1, weight=1)
+        ctk.CTkLabel(tab_video, text="Video File:", width=self._LABEL_WIDTH, anchor="w").grid(
+            row=0, column=0, sticky="w", padx=5, pady=8
         )
-        ctk.CTkButton(sec, text="Browse", width=80, command=self._browse_dir).grid(
-            row=2, column=2, padx=10, pady=3
+        ctk.CTkEntry(tab_video, textvariable=self._input_file).grid(
+            row=0, column=1, sticky="ew", padx=5, pady=8
+        )
+        ctk.CTkButton(tab_video, text="Browse", width=80, command=self._browse_file).grid(
+            row=0, column=2, padx=5, pady=8
         )
 
-        # Recursive
-        self._recursive = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(sec, text="Recursive folder scan", variable=self._recursive).grid(
-            row=3, column=0, columnspan=3, sticky="w", padx=10, pady=(3, 10)
+        tab_folder = tabs.add(_INPUT_TAB_FOLDER)
+        tab_folder.columnconfigure(1, weight=1)
+        ctk.CTkLabel(tab_folder, text="Input Folder:", width=self._LABEL_WIDTH, anchor="w").grid(
+            row=0, column=0, sticky="w", padx=5, pady=8
         )
+        ctk.CTkEntry(tab_folder, textvariable=self._input_dir).grid(
+            row=0, column=1, sticky="ew", padx=5, pady=8
+        )
+        ctk.CTkButton(tab_folder, text="Browse", width=80, command=self._browse_dir).grid(
+            row=0, column=2, padx=5, pady=8
+        )
+        ctk.CTkCheckBox(
+            tab_folder,
+            text="Recursive folder scan",
+            variable=self._recursive,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 8))
+
+        tabs.set(_INPUT_TAB_VIDEO)
 
     # -- Encoding ------------------------------------------------------
 
@@ -199,13 +236,13 @@ class VideoCompressApp(ctk.CTk):
                 side="left", padx=(0, 14)
             )
 
-        # Tabbed auto / manual
-        tabs = ctk.CTkTabview(sec, height=170)
+        # Tabbed auto / manual / camera profiles
+        tabs = ctk.CTkTabview(sec, height=360)
         tabs.grid(row=2, column=0, sticky="ew", padx=10, pady=5)
         self._tabs = tabs
 
         # ── Auto tab ──
-        auto = tabs.add("Auto Encoding (recommended)")
+        auto = tabs.add(_ENC_TAB_AUTO)
         auto.columnconfigure(1, weight=1)
 
         ctk.CTkLabel(auto, text="Search Presets:").grid(row=0, column=0, sticky="w", padx=5, pady=3)
@@ -223,22 +260,31 @@ class VideoCompressApp(ctk.CTk):
             auto, variable=self._metric, values=["vmaf", "ssim", "psnr"], width=160
         ).grid(row=1, column=1, sticky="w", padx=5, pady=3)
 
-        ctk.CTkLabel(auto, text="Threshold:").grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        ctk.CTkLabel(auto, text="Rate Control:").grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        self._auto_rc_mode = ctk.StringVar(value="vbr")
+        ctk.CTkOptionMenu(
+            auto,
+            variable=self._auto_rc_mode,
+            values=_RC_MODE_VALUES,
+            width=160,
+        ).grid(row=2, column=1, sticky="w", padx=5, pady=3)
+
+        ctk.CTkLabel(auto, text="Threshold:").grid(row=3, column=0, sticky="w", padx=5, pady=3)
         self._threshold = ctk.StringVar(value="")
         ctk.CTkEntry(
             auto,
             textvariable=self._threshold,
             placeholder_text="Auto (VMAF=95 · SSIM=0.97 · PSNR=40)",
             width=320,
-        ).grid(row=2, column=1, sticky="w", padx=5, pady=3)
+        ).grid(row=3, column=1, sticky="w", padx=5, pady=3)
 
         self._validate = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(auto, text="Post-encode quality validation", variable=self._validate).grid(
-            row=3, column=0, columnspan=2, sticky="w", padx=5, pady=3
+            row=4, column=0, columnspan=2, sticky="w", padx=5, pady=3
         )
 
         # ── Manual tab ──
-        manual = tabs.add("Manual Encoding")
+        manual = tabs.add(_ENC_TAB_MANUAL)
         manual.columnconfigure(1, weight=1)
 
         ctk.CTkLabel(manual, text="Preset:").grid(row=0, column=0, sticky="w", padx=5, pady=3)
@@ -246,7 +292,7 @@ class VideoCompressApp(ctk.CTk):
         ctk.CTkOptionMenu(
             manual,
             variable=self._preset,
-            values=["p1", "p2", "p3", "p4", "p5", "p6", "p7", "fast", "medium", "slow"],
+            values=_PRESET_VALUES,
             width=160,
         ).grid(row=0, column=1, sticky="w", padx=5, pady=3)
 
@@ -262,7 +308,150 @@ class VideoCompressApp(ctk.CTk):
         self._quality_label = ctk.CTkLabel(qf, text="22", width=35)
         self._quality_label.pack(side="left", padx=(10, 0))
 
-        tabs.set("Auto Encoding (recommended)")
+        ctk.CTkLabel(manual, text="Rate Control:").grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        self._manual_rc_mode = ctk.StringVar(value="vbr")
+        ctk.CTkOptionMenu(
+            manual,
+            variable=self._manual_rc_mode,
+            values=_RC_MODE_VALUES,
+            width=160,
+        ).grid(row=2, column=1, sticky="w", padx=5, pady=3)
+
+        # ── Camera tab ──
+        camera = tabs.add(_ENC_TAB_CAMERA)
+        camera.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(camera, text="Profile Family:").grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=5,
+            pady=3,
+        )
+        self._camera_profile_family = ctk.StringVar(value=default_profile_family_name())
+        ctk.CTkOptionMenu(
+            camera,
+            variable=self._camera_profile_family,
+            values=profile_family_names(),
+            command=self._on_camera_family_changed,
+            width=320,
+        ).grid(row=0, column=1, sticky="w", padx=5, pady=3)
+
+        ctk.CTkLabel(camera, text="Profile:").grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        camera_family = self._camera_profile_family.get()
+        self._camera_profile_name = ctk.StringVar(value=default_profile_name(camera_family))
+        self._camera_profile_menu = ctk.CTkOptionMenu(
+            camera,
+            variable=self._camera_profile_name,
+            values=profile_names(camera_family),
+            command=self._on_camera_profile_changed,
+            width=320,
+        )
+        self._camera_profile_menu.grid(row=1, column=1, sticky="w", padx=5, pady=3)
+
+        self._camera_profile_desc = ctk.CTkLabel(
+            camera,
+            text="",
+            wraplength=560,
+            justify="left",
+            text_color="gray",
+        )
+        self._camera_profile_desc.grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            padx=5,
+            pady=(0, 6),
+        )
+
+        self._camera_apply_codec_container = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            camera,
+            text="Apply profile codec/container defaults",
+            variable=self._camera_apply_codec_container,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=3)
+
+        ctk.CTkLabel(camera, text="Preset:").grid(row=4, column=0, sticky="w", padx=5, pady=3)
+        self._camera_preset = ctk.StringVar(value="p7")
+        ctk.CTkOptionMenu(
+            camera,
+            variable=self._camera_preset,
+            values=_PRESET_VALUES,
+            width=160,
+        ).grid(row=4, column=1, sticky="w", padx=5, pady=3)
+
+        ctk.CTkLabel(camera, text="Quality Factor:").grid(
+            row=5,
+            column=0,
+            sticky="w",
+            padx=5,
+            pady=3,
+        )
+        self._camera_quality = ctk.IntVar(value=24)
+        cqf = ctk.CTkFrame(camera, fg_color="transparent")
+        cqf.grid(row=5, column=1, sticky="w", padx=5, pady=3)
+        ctk.CTkSlider(
+            cqf,
+            from_=0,
+            to=51,
+            variable=self._camera_quality,
+            width=220,
+            command=self._on_camera_quality_slide,
+        ).pack(side="left")
+        self._camera_quality_label = ctk.CTkLabel(cqf, text="24", width=35)
+        self._camera_quality_label.pack(side="left", padx=(10, 0))
+
+        ctk.CTkLabel(camera, text="Rate Control:").grid(row=6, column=0, sticky="w", padx=5, pady=3)
+        self._camera_rc_mode = ctk.StringVar(value="vbr")
+        ctk.CTkOptionMenu(
+            camera,
+            variable=self._camera_rc_mode,
+            values=_RC_MODE_VALUES,
+            width=160,
+        ).grid(row=6, column=1, sticky="w", padx=5, pady=3)
+
+        ctk.CTkLabel(camera, text="Quality Metric:").grid(
+            row=7,
+            column=0,
+            sticky="w",
+            padx=5,
+            pady=3,
+        )
+        self._camera_metric = ctk.StringVar(value="vmaf")
+        ctk.CTkOptionMenu(
+            camera,
+            variable=self._camera_metric,
+            values=["vmaf", "ssim", "psnr"],
+            width=160,
+        ).grid(row=7, column=1, sticky="w", padx=5, pady=3)
+
+        ctk.CTkLabel(camera, text="Threshold:").grid(row=8, column=0, sticky="w", padx=5, pady=3)
+        self._camera_threshold = ctk.StringVar(value="")
+        ctk.CTkEntry(
+            camera,
+            textvariable=self._camera_threshold,
+            placeholder_text="Auto based on metric",
+            width=220,
+        ).grid(row=8, column=1, sticky="w", padx=5, pady=3)
+
+        self._camera_validate = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            camera,
+            text="Post-encode quality validation",
+            variable=self._camera_validate,
+        ).grid(row=9, column=0, columnspan=2, sticky="w", padx=5, pady=(3, 8))
+
+        ctk.CTkLabel(
+            camera,
+            text=encoding_guide_text(),
+            wraplength=640,
+            justify="left",
+            text_color="gray",
+        ).grid(row=10, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 8))
+
+        self._apply_camera_profile(camera_family, self._camera_profile_name.get())
+        tabs.set(_ENC_TAB_AUTO)
 
     # -- Options -------------------------------------------------------
 
@@ -390,15 +579,17 @@ class VideoCompressApp(ctk.CTk):
     def _browse_file(self) -> None:
         path = filedialog.askopenfilename(
             title="Select Video File",
-            filetypes=[("Video files", "*.mp4 *.mkv *.mov"), ("All files", "*.*")],
+            filetypes=video_filetypes(),
         )
         if path:
             self._input_file.set(path)
+            self._input_tabs.set(_INPUT_TAB_VIDEO)
 
     def _browse_dir(self) -> None:
         path = filedialog.askdirectory(title="Select Input Folder")
         if path:
             self._input_dir.set(path)
+            self._input_tabs.set(_INPUT_TAB_FOLDER)
 
     def _browse_output(self) -> None:
         path = filedialog.askdirectory(title="Select Output Directory")
@@ -420,6 +611,176 @@ class VideoCompressApp(ctk.CTk):
         """Update the quality numeric label next to the slider."""
         self._quality_label.configure(text=str(int(value)))
 
+    def _on_camera_quality_slide(self, value: float) -> None:
+        """Update the camera quality numeric label next to the slider."""
+        self._camera_quality_label.configure(text=str(int(value)))
+
+    def _on_camera_family_changed(self, selected_family: str) -> None:
+        """Refresh profile list when family changes and apply the default profile."""
+        names = profile_names(selected_family)
+        if not names:
+            return
+        self._camera_profile_menu.configure(values=names)
+        profile_name = default_profile_name(selected_family)
+        if profile_name not in names:
+            profile_name = names[0]
+        self._camera_profile_name.set(profile_name)
+        self._apply_camera_profile(selected_family, profile_name)
+
+    def _on_camera_profile_changed(self, selected_name: str) -> None:
+        """Apply selected camera profile defaults to camera controls."""
+        self._apply_camera_profile(self._camera_profile_family.get(), selected_name)
+
+    def _apply_camera_profile(self, family_name: str, profile_name: str) -> None:
+        """Apply camera profile defaults to GUI controls."""
+        profile = get_profile(family_name, profile_name)
+
+        self._camera_preset.set(profile.preset)
+        self._camera_quality.set(profile.quality)
+        self._camera_quality_label.configure(text=str(profile.quality))
+        self._camera_rc_mode.set(profile.rc_mode)
+        self._camera_metric.set(profile.quality_metric)
+        self._camera_threshold.set(str(profile.quality_threshold))
+        self._camera_validate.set(profile.validate_quality)
+        self._camera_profile_desc.configure(text=profile.description)
+
+        if self._camera_apply_codec_container.get():
+            self._codec.set(profile.codec.value)
+            self._container.set(profile.container.value)
+
+    def _parse_threshold(self, metric: str, threshold_text: str) -> float | None:
+        """Parse threshold text, falling back to metric defaults."""
+        text = threshold_text.strip()
+        if not text:
+            return _DEFAULT_QUALITY_THRESHOLDS.get(metric, default_threshold_for_metric(metric))
+        try:
+            return float(text)
+        except ValueError:
+            messagebox.showerror(
+                "Invalid Threshold",
+                f"Threshold must be numeric. Received: {threshold_text}",
+            )
+            return None
+
+    def _build_run_config(self) -> _RunConfig | None:
+        """Build a runtime configuration based on the active encoding tab."""
+        encoding_tab = self._tabs.get()
+
+        if encoding_tab == _ENC_TAB_AUTO:
+            metric = self._metric.get()
+            threshold = self._parse_threshold(metric, self._threshold.get())
+            if threshold is None:
+                return None
+            return _RunConfig(
+                auto_search=True,
+                metric=metric,
+                threshold=threshold,
+                rc_mode=self._auto_rc_mode.get(),
+                search_presets=_SEARCH_PRESET_MAP.get(self._search_presets.get(), []),
+                preset=self._preset.get(),
+                quality=self._quality.get(),
+                validate_quality=self._validate.get(),
+                mode_label="AUTO-SEARCH",
+            )
+
+        if encoding_tab == _ENC_TAB_MANUAL:
+            metric = self._metric.get()
+            threshold = self._parse_threshold(metric, self._threshold.get())
+            if threshold is None:
+                return None
+            return _RunConfig(
+                auto_search=False,
+                metric=metric,
+                threshold=threshold,
+                rc_mode=self._manual_rc_mode.get(),
+                search_presets=[],
+                preset=self._preset.get(),
+                quality=self._quality.get(),
+                validate_quality=self._validate.get(),
+                mode_label="MANUAL",
+            )
+
+        if encoding_tab == _ENC_TAB_CAMERA:
+            profile = get_profile(
+                self._camera_profile_family.get(),
+                self._camera_profile_name.get(),
+            )
+            if self._camera_apply_codec_container.get():
+                self._codec.set(profile.codec.value)
+                self._container.set(profile.container.value)
+
+            metric = self._camera_metric.get()
+            threshold = self._parse_threshold(metric, self._camera_threshold.get())
+            if threshold is None:
+                return None
+            return _RunConfig(
+                auto_search=False,
+                metric=metric,
+                threshold=threshold,
+                rc_mode=self._camera_rc_mode.get(),
+                search_presets=[],
+                preset=self._camera_preset.get(),
+                quality=self._camera_quality.get(),
+                validate_quality=self._camera_validate.get(),
+                mode_label=(
+                    "CAMERA PROFILE "
+                    f"[{self._camera_profile_family.get()} / {profile.name}]"
+                ),
+            )
+
+        messagebox.showerror("Invalid Encoding Mode", f"Unknown encoding mode: {encoding_tab}")
+        return None
+
+    def _collect_files_from_folder(self, input_dir: Path) -> list[Path] | None:
+        """Collect files from a folder and show user-facing errors if needed."""
+        if not input_dir.exists() or not input_dir.is_dir():
+            messagebox.showerror("Not Found", f"Input folder not found:\n{input_dir}")
+            return None
+
+        files = collect_video_files(input_dir, self._recursive.get(), probe_unknown=True)
+        if not files:
+            messagebox.showerror("No Videos", "No video files found in the selected folder.")
+            return None
+        return files
+
+    def _resolve_input_files(self) -> list[Path] | None:
+        """Resolve input files according to the selected input mode."""
+        input_mode = self._input_tabs.get().strip() or _INPUT_TAB_VIDEO
+        input_file = self._input_file.get().strip()
+        input_dir = self._input_dir.get().strip()
+
+        if input_mode == _INPUT_TAB_VIDEO:
+            if not input_file:
+                messagebox.showerror(
+                    "Input Required",
+                    "Select an input video file or switch to Folder mode.",
+                )
+                return None
+
+            source = Path(input_file)
+            if source.is_dir():
+                messagebox.showerror(
+                    "Invalid Input",
+                    "The selected video path is a folder. Use Folder mode instead.",
+                )
+                return None
+            if not source.exists() or not source.is_file():
+                messagebox.showerror("Not Found", f"Input file not found:\n{source}")
+                return None
+            return [source]
+
+        if input_mode == _INPUT_TAB_FOLDER:
+            if not input_dir:
+                messagebox.showerror(
+                    "Input Required",
+                    "Select an input folder or switch to Video File mode.",
+                )
+                return None
+            return self._collect_files_from_folder(Path(input_dir))
+
+        messagebox.showerror("Invalid Input Mode", f"Unknown input mode: {input_mode}")
+        return None
+
     # ── Job lifecycle ────────────────────────────────────────────────
 
     def _start_job(self) -> None:
@@ -428,50 +789,15 @@ class VideoCompressApp(ctk.CTk):
             return
 
         # --- Resolve input files ---
-        input_file = self._input_file.get().strip()
-        input_dir = self._input_dir.get().strip()
-
-        if not input_file and not input_dir:
-            messagebox.showerror("Input Required", "Select an input video file or folder.")
+        files = self._resolve_input_files()
+        if not files:
             return
 
-        if input_file:
-            source = Path(input_file)
-            if source.is_dir():
-                input_dir = input_file
-                input_file = ""
-            elif not source.exists() or not source.is_file():
-                messagebox.showerror("Not Found", f"Input file not found:\n{source}")
-                return
-
-        if input_file:
-            files = [Path(input_file)]
-        else:
-            source = Path(input_dir)
-            if not source.exists() or not source.is_dir():
-                messagebox.showerror("Not Found", f"Input folder not found:\n{source}")
-                return
-            files: list[Path] = []
-            for pat in _VIDEO_EXTENSIONS:
-                if self._recursive.get():
-                    files.extend(source.rglob(pat))
-                else:
-                    files.extend(source.glob(pat))
-            files = sorted({p for p in files if p.is_file()})
-            if not files:
-                messagebox.showerror("No Videos", "No video files found in the selected folder.")
-                return
-
         # --- Gather settings ---
-        auto_search = self._tabs.get() == "Auto Encoding (recommended)"
-        metric = self._metric.get()
-        threshold_text = self._threshold.get().strip()
-        threshold = (
-            float(threshold_text)
-            if threshold_text
-            else _DEFAULT_QUALITY_THRESHOLDS.get(metric, 95.0)
-        )
-        search_presets = _SEARCH_PRESET_MAP.get(self._search_presets.get(), [])
+        run_config = self._build_run_config()
+        if run_config is None:
+            return
+
         output_dir = Path(self._output_dir.get().strip() or "./output")
         report_json = Path(self._report.get().strip()) if self._report.get().strip() else None
 
@@ -483,18 +809,22 @@ class VideoCompressApp(ctk.CTk):
         self._progress.set(0)
         self._console_clear()
 
-        mode = "AUTO-SEARCH" if auto_search else "MANUAL"
         self._console_write(f"{'=' * 60}")
-        self._console_write(f"  Mode:    {mode}")
+        self._console_write(f"  Mode:    {run_config.mode_label}")
+        self._console_write(f"  Input:   {self._input_tabs.get()}")
         self._console_write(f"  Files:   {len(files)}")
         codec = self._codec.get()
         ctr = self._container.get()
         self._console_write(f"  Codec:   {codec}  |  Container: {ctr}")
-        if auto_search:
-            self._console_write(f"  Metric:  {metric}  |  Threshold: {threshold}")
+        if run_config.auto_search:
+            self._console_write(
+                f"  Metric:  {run_config.metric}  |  "
+                f"Threshold: {run_config.threshold}  |  RC: {run_config.rc_mode}"
+            )
         else:
             self._console_write(
-                f"  Preset:  {self._preset.get()}  |  Quality: {self._quality.get()}"
+                f"  Preset:  {run_config.preset}  |  "
+                f"Quality: {run_config.quality}  |  RC: {run_config.rc_mode}"
             )
         self._console_write(f"{'=' * 60}\n")
 
@@ -503,10 +833,7 @@ class VideoCompressApp(ctk.CTk):
             target=self._worker,
             args=(
                 files,
-                auto_search,
-                metric,
-                threshold,
-                search_presets,
+                run_config,
                 output_dir,
                 report_json,
             ),
@@ -525,10 +852,7 @@ class VideoCompressApp(ctk.CTk):
     def _worker(
         self,
         files: list[Path],
-        auto_search: bool,
-        metric: str,
-        threshold: float,
-        search_presets: list[str],
+        run_config: _RunConfig,
         output_dir: Path,
         report_json: Path | None,
     ) -> None:
@@ -565,20 +889,21 @@ class VideoCompressApp(ctk.CTk):
                 output_container=Container(self._container.get()),
                 codec=TargetCodec(self._codec.get()),
                 fallback_mode=FallbackMode(self._fallback.get()),
-                preset=self._preset.get(),
-                quality=self._quality.get(),
-                quality_mode=auto_search,
-                validate_quality=self._validate.get(),
-                quality_metric=metric,
-                quality_threshold=threshold,
-                auto_search_best=auto_search,
+                preset=run_config.preset,
+                quality=run_config.quality,
+                quality_mode=run_config.auto_search,
+                validate_quality=run_config.validate_quality,
+                quality_metric=run_config.metric,
+                quality_threshold=run_config.threshold,
+                rc_mode=run_config.rc_mode,
+                auto_search_best=run_config.auto_search,
                 enable_gpu_optimization=self._gpu.get(),
                 dry_run=self._dryrun.get(),
                 overwrite=self._overwrite.get(),
                 audio_mode=AudioMode(self._audio.get()),
                 report_json=per_report,
                 lossless=self._lossless.get(),
-                search_presets=search_presets,
+                search_presets=run_config.search_presets,
             )
 
             try:
@@ -604,6 +929,14 @@ class VideoCompressApp(ctk.CTk):
 
                 if self._dryrun.get():
                     q.put(("log", f"  {outcome.input_path.name}: DRY RUN"))
+                elif outcome.copied_original:
+                    q.put(
+                        (
+                            "log",
+                            f"  {outcome.input_path.name}: kept original "
+                            "(encoded file was larger; conversion skipped)",
+                        )
+                    )
                 else:
                     q.put(
                         (
@@ -620,7 +953,7 @@ class VideoCompressApp(ctk.CTk):
                             "log",
                             f"    preset={opt.preset}  CQ={opt.quality}  "
                             f"rc={opt.rc_mode}  {opt.bit_depth}-bit  "
-                            f"{metric}={opt.similarity_value:.2f}",
+                            f"{run_config.metric}={opt.similarity_value:.2f}",
                         )
                     )
 

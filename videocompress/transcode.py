@@ -26,6 +26,7 @@ from pathlib import Path
 from videocompress.capabilities import ensure_gpu_probe_or_raise, probe_capabilities
 from videocompress.ffprobe_info import InputInfo, inspect_input
 from videocompress.models import (
+    AudioMode,
     Container,
     FallbackMode,
     JobError,
@@ -64,6 +65,46 @@ def _codec_suffix(codec: TargetCodec, lossless: bool) -> str:
     if lossless:
         return "hevc"  # lossless always uses hevc_nvenc
     return "av1" if codec == TargetCodec.AV1 else "hevc"
+
+
+def _resolve_rc_mode_for_encoder(requested: str, encoder: str) -> tuple[str, str | None]:
+    """Resolve an effective RC mode for the given encoder.
+
+    Returns ``(effective_mode, diagnostic)`` where ``diagnostic`` is ``None``
+    unless the requested mode had to be adjusted.
+    """
+    requested_l = requested.strip().lower()
+
+    if "nvenc" in encoder:
+        default = "vbr"
+        allowed = {"vbr", "constqp", "cbr"}
+    else:
+        default = "crf"
+        allowed = {"crf"}
+
+    if requested_l == "auto":
+        return default, None
+
+    if requested_l in allowed:
+        return requested_l, None
+
+    diagnostic = f"rc-mode-adjusted:{requested_l}-to-{default}-for-{encoder}"
+    return default, diagnostic
+
+
+def _rate_control_args(encoder: str, rc_mode: str, quality: int) -> list[str]:
+    """Build FFmpeg rate-control args for the target encoder."""
+    if "nvenc" in encoder:
+        if rc_mode == "constqp":
+            return ["-rc", "constqp", "-qp", str(quality)]
+        if rc_mode == "cbr":
+            return ["-rc", "cbr", "-b:v", f"{quality}M"]
+        return ["-rc", "vbr", "-cq", str(quality), "-b:v", "0"]
+
+    if "libaom-av1" in encoder:
+        return ["-crf", str(quality), "-b:v", "0", "-cpu-used", "6", "-row-mt", "1"]
+
+    return ["-crf", str(quality)]
 
 
 def _select_codec_path(
@@ -155,10 +196,37 @@ def _resolve_container(
     subtitle_codecs: list[str],
     diagnostics: list[str],
 ) -> Container:
+    mp4_text_subtitles = {"mov_text", "subrip", "ass", "ssa", "webvtt", "text"}
+
+    if requested == Container.MP4 and subtitle_codecs:
+        # MP4 cannot mux many subtitle codecs in copy mode (e.g. subrip).
+        # Keep MP4 only when subtitles are text-based and convertible to mov_text.
+        if not all(c in mp4_text_subtitles for c in subtitle_codecs):
+            diagnostics.append("container-adjusted:mp4-to-mkv-for-unsupported-subtitle-codec")
+            return Container.MKV
+
     if requested == Container.MKV and any(c == "mov_text" for c in subtitle_codecs):
         diagnostics.append("container-adjusted:mkv-to-mp4-for-mov_text-subtitle-copy")
         return Container.MP4
     return requested
+
+
+def _subtitle_args_for_container(
+    container: Container,
+    subtitle_codecs: list[str],
+    diagnostics: list[str],
+) -> list[str]:
+    if not subtitle_codecs:
+        return ["-c:s", "copy"]
+
+    if container == Container.MP4:
+        if all(codec == "mov_text" for codec in subtitle_codecs):
+            return ["-c:s", "copy"]
+
+        diagnostics.append("subtitle-adjusted:converted-to-mov_text-for-mp4")
+        return ["-c:s", "mov_text"]
+
+    return ["-c:s", "copy"]
 
 
 def _output_path(
@@ -171,6 +239,16 @@ def _output_path(
     return output_dir / f"{input_path.stem}.{codec_suffix}.{container.value}"
 
 
+def _copy_original_to_output(input_path: Path, output_dir: Path) -> Path:
+    """Copy the original input into *output_dir* and return the copied path."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    target = output_dir / input_path.name
+    if target.resolve() != input_path.resolve():
+        shutil.copy2(input_path, target)
+        return target
+    return input_path
+
+
 # ---------------------------------------------------------------------------
 # FFmpeg command building
 # ---------------------------------------------------------------------------
@@ -179,9 +257,11 @@ def _output_path(
 def _build_command(
     opts: JobOptions,
     selected: SelectedPath,
+    container: Container,
     output_path: Path,
     probe: ProbeResult,
     input_info: InputInfo,
+    diagnostics: list[str],
 ) -> list[str]:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -193,6 +273,9 @@ def _build_command(
 
     cmd = [ffmpeg, "-hide_banner", "-y" if opts.overwrite else "-n"]
     encoder_args = list(opts.encoder_extra_args or [])
+    rc_mode, rc_diag = _resolve_rc_mode_for_encoder(opts.rc_mode, selected.encoder)
+    if rc_diag:
+        diagnostics.append(rc_diag)
 
     if use_cuvid:
         # Full GPU zero-copy transcode path
@@ -204,23 +287,36 @@ def _build_command(
             "-c:v",
             "h264_cuvid",
         ]
-    elif selected.used_gpu:
-        # GPU encode only (software decode, GPU upload)
-        cmd += ["-hwaccel", "cuda"]
+
+    if opts.audio_mode == AudioMode.AAC:
+        audio_args = ["-c:a", "aac"]
+    elif opts.audio_mode == AudioMode.OPUS:
+        audio_args = ["-c:a", "libopus"]
+    else:
+        audio_args = ["-c:a", "copy"]
+
+    subtitle_args = _subtitle_args_for_container(
+        container=container,
+        subtitle_codecs=input_info.subtitle_codecs,
+        diagnostics=diagnostics,
+    )
 
     cmd += [
+        "-analyzeduration",
+        "200M",
+        "-probesize",
+        "200M",
         "-i",
         str(opts.input_path.resolve()),
         "-map",
         "0",
+        "-dn",
         "-map_metadata",
         "0",
         "-map_chapters",
         "0",
-        "-c:a",
-        "copy",
-        "-c:s",
-        "copy",
+        *audio_args,
+        *subtitle_args,
     ]
 
     if opts.lossless:
@@ -242,15 +338,14 @@ def _build_command(
                 del encoder_args[pix_fmt_idx : pix_fmt_idx + 2]
                 cmd += ["-vf", f"scale_cuda=format={pix_fmt}"]
 
-        cmd += ["-c:v", selected.encoder, "-preset", opts.preset]
+        cmd += ["-c:v", selected.encoder]
+        if "libaom-av1" not in selected.encoder:
+            cmd += ["-preset", opts.preset]
         if encoder_args:
             # Use optimized encoding parameters from parameter search
             cmd += encoder_args
-        elif selected.used_gpu and "nvenc" in selected.encoder:
-            # VBR: quality-constrained variable bitrate — better efficiency than CQ-only
-            cmd += ["-rc", "vbr", "-cq", str(opts.quality), "-b:v", "0"]
         else:
-            cmd += ["-crf", str(opts.quality)]
+            cmd += _rate_control_args(selected.encoder, rc_mode, opts.quality)
 
     cmd.append(str(output_path))
     return cmd
@@ -346,6 +441,37 @@ def run_job(
         if progress_callback:
             progress_callback(-1.0, msg)
 
+    def _scale_progress(stage_offset: float, stage_span: float) -> ProgressCallback:
+        def _scaled(pct: float, msg: str) -> None:
+            if not progress_callback:
+                return
+            if pct < 0:
+                progress_callback(pct, msg)
+                return
+            scaled = stage_offset + (pct / 100.0) * stage_span
+            progress_callback(scaled, msg)
+
+        return _scaled
+
+    has_optimization = not opts.lossless and opts.quality_mode and opts.auto_search_best
+    has_validation = opts.validate_quality and not opts.dry_run
+
+    if has_optimization and progress_callback:
+        optimization_span = 25.0
+        validation_span = 5.0 if has_validation else 0.0
+        encode_span = 100.0 - optimization_span - validation_span
+        progress_opt = _scale_progress(0.0, optimization_span)
+        progress_encode = _scale_progress(optimization_span, encode_span)
+        progress_validate = (
+            _scale_progress(optimization_span + encode_span, validation_span)
+            if validation_span > 0
+            else None
+        )
+    else:
+        progress_opt = None
+        progress_encode = progress_callback
+        progress_validate = None
+
     _log("Probing environment…")
     probe = probe_capabilities()
     input_info = inspect_input(opts.input_path)
@@ -353,13 +479,48 @@ def run_job(
     diagnostics = list(probe.diagnostics)
     selected = _select_codec_path(opts, probe, diagnostics)
 
-    mode_str = "lossless" if opts.lossless else f"quality={opts.quality}"
+    if opts.rc_mode != "auto":
+        effective_rc_mode, rc_diag = _resolve_rc_mode_for_encoder(opts.rc_mode, selected.encoder)
+        if rc_diag:
+            diagnostics.append(rc_diag)
+            _log(
+                "RC mode adjusted for encoder compatibility: "
+                f"{opts.rc_mode} -> {effective_rc_mode}"
+            )
+        opts.rc_mode = effective_rc_mode
+
+    mode_str = "lossless" if opts.lossless else f"quality={opts.quality} rc={opts.rc_mode}"
     cuvid = selected.used_gpu and probe.h264_cuvid and input_info.video.codec_name == "h264"
     gpu_str = f"{'cuvid→' if cuvid else ''}{selected.encoder}"
     _log(f"Encoder: {gpu_str}  mode: {mode_str}  GPU: {selected.used_gpu}")
 
+    if not opts.dry_run and not input_info.video.pix_fmt:
+        diagnostics.append("warning:input-video-undecodable-original-kept")
+        _log(
+            "Input stream appears undecodable for transcoding "
+            "(missing pixel format). Keeping original file."
+        )
+        kept_path = _copy_original_to_output(opts.input_path, opts.output_dir)
+        input_size = opts.input_path.stat().st_size
+        return JobOutcome(
+            input_path=opts.input_path,
+            output_path=kept_path,
+            selected_path=selected,
+            probe=probe,
+            duration_seconds=input_info.duration_seconds,
+            input_size=input_size,
+            output_size=input_size,
+            compression_ratio=1.0,
+            optimization=None,
+            metrics={},
+            command=[],
+            diagnostics=diagnostics,
+            copied_original=True,
+            taxonomy=None,
+        )
+
     optimization = None
-    if not opts.lossless and opts.quality_mode and opts.auto_search_best:
+    if has_optimization:
         seg_positions = _sample_positions(input_info.duration_seconds, 20.0)
         n_segs = len(seg_positions)
         _log(
@@ -367,8 +528,8 @@ def run_job(
             f"({n_segs} segment{'s' if n_segs != 1 else ''} × 20 s, "
             f"{opts.quality_metric} threshold={opts.quality_threshold:.2f})"
         )
-        if progress_callback:
-            progress_callback(0.0, "Optimizing quality parameters…")
+        if progress_opt:
+            progress_opt(0.0, "Optimizing quality parameters…")
         candidates = build_default_candidates(selected.effective_codec, selected.encoder)
         # Filter candidates to only the presets selected by the user (if not "all")
         if opts.search_presets:
@@ -377,6 +538,19 @@ def run_job(
                 f"Preset filter active: searching only "
                 f"{opts.search_presets} ({len(candidates)} candidates)"
             )
+        if opts.rc_mode != "auto":
+            candidates = [c for c in candidates if c.rc_mode == opts.rc_mode]
+            _log(
+                "RC filter active: "
+                f"searching only rc={opts.rc_mode} ({len(candidates)} candidates)"
+            )
+
+        if not candidates:
+            raise JobError(
+                "optimizer-no-candidates",
+                "No candidate matches the selected preset/rc filters for this encoder.",
+            )
+
         optimization = optimize_encoding_params(
             input_path=opts.input_path,
             encoder=selected.encoder,
@@ -385,9 +559,11 @@ def run_job(
             initial_candidates=candidates,
             container_suffix=opts.output_container.value,
             input_duration_seconds=input_info.duration_seconds,
+            progress_callback=progress_opt,
         )
         opts.preset = optimization.preset
         opts.quality = optimization.quality
+        opts.rc_mode = optimization.rc_mode
         opts.encoder_extra_args = optimization.extra_args
         if optimization.similarity_value is not None:
             score_str = (
@@ -399,12 +575,15 @@ def run_job(
             _log(
                 f"Best params: preset={optimization.preset}"
                 f"  quality={optimization.quality}"
+                f"  rc={optimization.rc_mode}"
                 f"{score_str}"
             )
         else:
             _log(
-                f"Best params: preset={optimization.preset}  quality={optimization.quality}"
-                "  (metric unavailable — used safest candidate)"
+                f"Best params: preset={optimization.preset}"
+                f"  quality={optimization.quality}"
+                f"  rc={optimization.rc_mode}"
+                "  (metric unavailable — used balanced fallback candidate)"
             )
 
     effective_container = _resolve_container(
@@ -415,7 +594,15 @@ def run_job(
 
     suffix = _codec_suffix(selected.effective_codec, opts.lossless)
     output_path = _output_path(opts.input_path, opts.output_dir, effective_container, suffix)
-    command = _build_command(opts, selected, output_path, probe, input_info)
+    command = _build_command(
+        opts,
+        selected,
+        effective_container,
+        output_path,
+        probe,
+        input_info,
+        diagnostics,
+    )
 
     _log(f"Output: {output_path}")
     if opts.dry_run:
@@ -423,12 +610,12 @@ def run_job(
 
     start = time.perf_counter()
     if not opts.dry_run:
-        if progress_callback:
-            progress_callback(0.0, "Starting encode…")
+        if progress_encode:
+            progress_encode(0.0, "Starting encode…")
         returncode, stderr_text = _run_ffmpeg(
             command,
             input_info.duration_seconds,
-            progress_callback,
+            progress_encode,
             stop_event,
         )
         if stop_event and stop_event.is_set():
@@ -440,20 +627,38 @@ def run_job(
     input_size = opts.input_path.stat().st_size
     output_size = output_path.stat().st_size if output_path.exists() else 0
     compression_ratio = (output_size / input_size) if input_size else 0.0
+    copied_original = False
 
-    if not opts.dry_run and output_size > 0 and output_size >= input_size:
+    if (
+        not opts.dry_run
+        and opts.keep_original_if_larger
+        and output_size > 0
+        and output_size >= input_size
+    ):
         diagnostics.append(
-            f"warning:output-not-smaller "
-            f"({output_size // 1_048_576} MB >= "
-            f"{input_size // 1_048_576} MB) "
-            "— source may already be efficiently "
-            "compressed; consider a higher CQ "
-            "or different codec"
+            "warning:encoded-output-not-smaller-original-kept"
         )
+        _log(
+            "Encoded output is not smaller than source; "
+            "keeping the original file instead of converting."
+        )
+        if output_path.exists():
+            output_path.unlink()
+
+        output_path = _copy_original_to_output(opts.input_path, opts.output_dir)
+
+        output_size = input_size
+        compression_ratio = 1.0
+        copied_original = True
 
     metrics: dict = {}
-    if opts.validate_quality and not opts.dry_run and output_path.exists():
+    if copied_original and opts.validate_quality and not opts.dry_run:
+        _log("Skipping quality validation because original file was kept.")
+
+    if opts.validate_quality and not opts.dry_run and output_path.exists() and not copied_original:
         _log("Running post-encode quality validation...")
+        if progress_validate:
+            progress_validate(0.0, "Validating quality…")
         val_metric_name = opts.quality_metric
         val_threshold = opts.quality_threshold
         metric = run_metric(opts.input_path, output_path, val_metric_name)
@@ -470,6 +675,8 @@ def run_job(
             )
         elif metric.available and metric.value is not None:
             _log(f"Quality check: {val_metric_name}={metric.value:.4f} OK")
+        if progress_validate:
+            progress_validate(100.0, "Quality validation complete")
 
     if selected.fallback_used and selected.fallback_reason:
         diagnostics.append(f"fallback:{selected.fallback_reason}")
@@ -487,5 +694,6 @@ def run_job(
         metrics=metrics,
         command=command,
         diagnostics=diagnostics,
+        copied_original=copied_original,
         taxonomy=None,
     )

@@ -102,3 +102,44 @@ def inspect_input(path: Path) -> InputInfo:
         video=video,
         subtitle_codecs=subtitle_codecs,
     )
+
+
+def has_video_stream(path: Path) -> bool:
+    """Return True if ffprobe detects a video stream in *path*.
+
+    This helper is intentionally permissive: failures to probe return False
+    instead of raising, so callers can fall back to other discovery logic.
+    """
+    if not path.exists() or not path.is_file():
+        return False
+
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return False
+
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "default=nw=1:nk=1",
+        str(path.resolve()),
+    ]
+
+    proc = subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    if proc.returncode != 0:
+        return False
+
+    return "video" in (proc.stdout or "").lower()
